@@ -1,0 +1,183 @@
+# Example MDM data models.
+#
+# Import with:
+#   curl -X POST "$BASE/api/v1/models/import?dry_run=false" \
+#        -b cookies.txt -F "file=@examples/models.yaml"
+#
+# Importing only writes definitions. Publish each entity afterwards to create
+# the physical landing / staging / live / history tables.
+mdm_schema_version: "1.0"
+
+entities:
+  # ─────────────────────────────────────────────────────────────── customer
+  - name: customer
+    display_name: Customer Master
+    domain: party
+    description: Golden customer records consolidated from CRM and ERP.
+    requires_approval: true
+    soft_delete: true
+    attributes:
+      - name: customer_code
+        display_name: Customer Code
+        description: Immutable business identifier assigned by the source system.
+        data_type: string
+        length: 40
+        is_required: true
+        is_unique: true
+        is_business_key: true
+        normalization: [trim, upper]
+      - name: legal_name
+        display_name: Legal Name
+        data_type: string
+        length: 250
+        is_required: true
+        is_match_key: true
+        normalization: [trim, collapse_whitespace]
+      - name: trading_name
+        display_name: Trading Name
+        data_type: string
+        length: 250
+        normalization: [trim, collapse_whitespace]
+      - name: tax_id
+        display_name: Tax / ABN
+        data_type: string
+        length: 30
+        is_indexed: true
+        is_pii: true
+        normalization: [trim, digits_only]
+      - name: email
+        display_name: Primary Email
+        data_type: email
+        is_pii: true
+        normalization: [trim, lower]
+      - name: phone
+        display_name: Phone
+        data_type: string
+        length: 40
+        is_pii: true
+        normalization: [trim, digits_only]
+      - name: country
+        display_name: Country
+        data_type: enum
+        length: 2
+        validation:
+          enum: [AU, NZ, US, GB, DE, SG, JP]
+      - name: credit_limit
+        display_name: Credit Limit
+        data_type: decimal
+        numeric_precision: 14
+        numeric_scale: 2
+        validation:
+          min: 0
+      - name: segment
+        display_name: Segment
+        data_type: enum
+        length: 20
+        validation:
+          enum: [enterprise, mid_market, smb, government]
+      - name: onboarded_on
+        display_name: Onboarded On
+        data_type: date
+      - name: is_active
+        display_name: Active
+        data_type: boolean
+        default_value: "true"
+
+  # ──────────────────────────────────────────────────────────────── product
+  - name: product
+    display_name: Product Master
+    domain: catalog
+    description: Sellable products and services.
+    requires_approval: true
+    soft_delete: true
+    attributes:
+      - name: sku
+        display_name: SKU
+        data_type: string
+        length: 40
+        is_required: true
+        is_unique: true
+        is_business_key: true
+        normalization: [trim, upper]
+      - name: product_name
+        display_name: Product Name
+        data_type: string
+        length: 300
+        is_required: true
+        is_match_key: true
+        normalization: [trim, collapse_whitespace]
+      - name: category
+        display_name: Category
+        data_type: enum
+        length: 40
+        validation:
+          enum: [hardware, software, service, subscription]
+      - name: unit_price
+        display_name: Unit Price
+        data_type: decimal
+        numeric_precision: 12
+        numeric_scale: 2
+        validation:
+          min: 0
+      - name: currency
+        display_name: Currency
+        data_type: enum
+        length: 3
+        default_value: AUD
+        validation:
+          enum: [AUD, NZD, USD, GBP, EUR]
+      - name: launch_date
+        display_name: Launch Date
+        data_type: date
+      - name: specifications
+        display_name: Specifications
+        description: Free-form attributes that vary by category.
+        data_type: json
+      - name: discontinued
+        display_name: Discontinued
+        data_type: boolean
+        default_value: "false"
+
+  # ───────────────────────────────────────────────────────────────── vendor
+  - name: vendor
+    display_name: Vendor Master
+    domain: party
+    description: Approved suppliers and their payment terms.
+    requires_approval: true
+    soft_delete: true
+    attributes:
+      - name: vendor_code
+        display_name: Vendor Code
+        data_type: string
+        length: 30
+        is_required: true
+        is_unique: true
+        is_business_key: true
+        normalization: [trim, upper]
+      - name: legal_name
+        display_name: Legal Name
+        data_type: string
+        length: 250
+        is_required: true
+        is_match_key: true
+        normalization: [trim, collapse_whitespace]
+      - name: contact_email
+        display_name: Accounts Payable Email
+        data_type: email
+        normalization: [trim, lower]
+      - name: country
+        display_name: Country
+        data_type: enum
+        length: 2
+        validation:
+          enum: [AU, NZ, US, GB, DE, SG, CN]
+      - name: payment_terms_days
+        display_name: Payment Terms (days)
+        data_type: integer
+        validation:
+          min: 0
+          max: 180
+      - name: is_approved
+        display_name: Approved Supplier
+        data_type: boolean
+        default_value: "false"

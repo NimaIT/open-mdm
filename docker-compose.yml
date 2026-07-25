@@ -1,0 +1,51 @@
+# Evaluation stack: PostgreSQL + the application.
+# For production, drop the `db` service and point PG* at your managed cluster.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mdm
+      POSTGRES_USER: mdm_ddl          # owns the schemas; publishes DDL
+      POSTGRES_PASSWORD: ${PG_DDL_PASSWORD:-ddl-dev-password}
+    volumes:
+      - mdm-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mdm_ddl -d mdm"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # Not published by default — the app reaches it over the compose network.
+    expose:
+      - "5432"
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-false}
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: mdm
+      PGSSLMODE: disable            # in-network only; use require for external DBs
+      # Single role in this evaluation stack. In production use two.
+      PGUSER: mdm_ddl
+      PGPASSWORD: ${PG_DDL_PASSWORD:-ddl-dev-password}
+      LOCAL_ADMIN_ENABLED: "true"
+      LOCAL_ADMIN_USERNAME: ${LOCAL_ADMIN_USERNAME:-admin}
+      LOCAL_ADMIN_PASSWORD: ${LOCAL_ADMIN_PASSWORD:-}
+      LDAP_ENABLED: ${LDAP_ENABLED:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8000}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    # Provision schemas and metadata tables, then serve.
+    command: >
+      sh -c "python -m scripts.bootstrap &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000
+             --proxy-headers --forwarded-allow-ips '*'"
+
+volumes:
+  mdm-data:
