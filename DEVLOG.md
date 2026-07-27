@@ -409,3 +409,25 @@ Open http://127.0.0.1:8000 — **admin** / value of `LOCAL_ADMIN_PASSWORD` in `.
 `steward_class`, `power_user1`, `reader1`.
 
 **Run tests:** `.venv/Scripts/python -m pytest -q` (needs Postgres).
+
+---
+
+## Git state (as of 2026-07-27, end of session)
+
+All work is **committed and pushed**. Status: everything below is DONE.
+
+- **Remote:** `origin` → https://github.com/NimaIT/open-mdm *(private; created this
+  session — the repo had no remote before)*. `.env` is gitignored (never pushed).
+- **`master`** → `66e9145` (original base build, unchanged).
+- **`feat/functional-requirements-buildout`** → `563c042` — the entire W1–W9
+  buildout as ONE commit (49 files, +12,185/−351). Pushed, tracking `origin`.
+- **No PR opened yet** — branch is ready for a PR against `master`:
+  https://github.com/NimaIT/open-mdm/pull/new/feat/functional-requirements-buildout
+- Working tree is **clean** (nothing uncommitted). Full suite: **439 passed**.
+
+### Resume checklist for a fresh session
+1. `git log --oneline -3` — confirm you're on `feat/functional-requirements-buildout` at `563c042`.
+2. Start Postgres + app (see HOW TO RUN above); reseed the demo if the DB was reset.
+3. This buildout is COMPLETE. Open follow-ups if any: open the PR, wire real SMTP,
+   or the one logged cosmetic (reference fields in the review editor show the
+   resolved UUID rather than a friendly label — the FK autocomplete works).
