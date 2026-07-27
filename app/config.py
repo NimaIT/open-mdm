@@ -16,6 +16,16 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEBUG: bool = False
     API_PREFIX: str = "/api/v1"
+
+    # ------------------------------------------------- observability (AO-1)
+    # Structured JSON logging to stdout (for ELK/Splunk ingestion). Off by
+    # default so local runs keep human-readable text logs; enable per env.
+    LOG_JSON: bool = False
+    LOG_LEVEL: str = "INFO"
+    # Also mirror each named stream (platform/integration/custom) to its own
+    # rotating JSON file under LOG_DIR, for file-based log shipping.
+    LOG_STREAM_FILES: bool = False
+    LOG_DIR: Optional[str] = None
     SECRET_KEY: str = Field(
         default="CHANGE-ME-dev-only-secret-key-not-for-production",
         description="Signing key for session cookies and JWTs.",
@@ -50,6 +60,9 @@ class Settings(BaseSettings):
     SCHEMA_STAGING: str = "mdm_staging"
     SCHEMA_LIVE: str = "mdm"
     SCHEMA_HISTORY: str = "mdm_history"
+    # Downstream distribution schema (Workstream 5). Holds one materialized view
+    # per published entity — the stable, queryable surface for BI / APIs.
+    SCHEMA_PUBLISH: str = "mdm_pub"
 
     # ---------------------------------------------------------------- LDAP
     LDAP_ENABLED: bool = False
@@ -82,13 +95,57 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------ behaviour
     # A steward may not approve a record they submitted or last edited.
     ENFORCE_SEGREGATION_OF_DUTIES: bool = True
+    # Governed change management (Workstream 3). When on, every review decision
+    # (approve / reject / request_changes) must carry a non-empty comment, so the
+    # workflow history records *why* each transition happened (GC-4).
+    REQUIRE_REVIEW_COMMENTS: bool = True
+    # When on, a submitter must supply a rationale on the write path before the
+    # change is accepted. Off by default so machine ingestion is not broken; the
+    # field is always threaded through so a UI can require it (GC-4).
+    REQUIRE_SUBMIT_RATIONALE: bool = False
     ALLOW_DESTRUCTIVE_DDL: bool = False
     AUTO_PROMOTE_LANDING: bool = True
+    # Extensibility (EX-1): importable module paths loaded at startup so operators
+    # can register pipeline hooks / custom transforms by dropping in a module.
+    # Import failures are logged, not fatal. Accepts a comma-separated env value.
+    HOOK_MODULES: List[str] = []
     SOFT_DELETE: bool = True
     MAX_BULK_ROWS: int = 10_000
     CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:8000"]
 
-    @field_validator("CORS_ORIGINS", mode="before")
+    # ----------------------------------------------------- notifications (W4)
+    # Master switch. When off, enqueue_notification is a no-op (no rows, no I/O).
+    NOTIFICATIONS_ENABLED: bool = True
+    # Transport selection: 'outbox' (dev — record only, NO network I/O),
+    # 'smtp' (real send), or 'both' (record AND send). Default 'outbox' keeps
+    # local runs / tests entirely off the network.
+    NOTIFICATION_TRANSPORT: str = "outbox"
+    # Base URL used to build deep-links back to a record/task in the UI.
+    APP_BASE_URL: str = "http://localhost:8000"
+    # Default From address; a template's from_address overrides per domain.
+    NOTIFICATION_FROM: str = "mdm@localhost"
+    # SMTP service account (the per-environment sender). prod vs non-prod differ
+    # purely by these env vars.
+    SMTP_HOST: Optional[str] = None
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
+    SMTP_USE_TLS: bool = True
+    SMTP_TIMEOUT: int = 10
+
+    # ------------------------------------- scheduler & distribution (W5)
+    # In-process, stdlib-thread scheduler. OFF by default so tests / local runs
+    # never spawn background threads unexpectedly; enabled explicitly per env.
+    SCHEDULER_ENABLED: bool = False
+    # How often the scheduler refreshes every entity's mdm_pub materialized view.
+    VIEW_REFRESH_INTERVAL_SECONDS: int = 600
+    # How often the retention job prunes aged landing / history rows.
+    RETENTION_INTERVAL_SECONDS: int = 3600
+    # Whether the scheduled retention job runs at all. The manual admin endpoint
+    # runs regardless of this switch.
+    RETENTION_ENABLED: bool = True
+
+    @field_validator("CORS_ORIGINS", "HOOK_MODULES", mode="before")
     @classmethod
     def _split_origins(cls, v):
         if isinstance(v, str):
@@ -133,6 +190,7 @@ class Settings(BaseSettings):
             self.SCHEMA_STAGING,
             self.SCHEMA_LIVE,
             self.SCHEMA_HISTORY,
+            self.SCHEMA_PUBLISH,
         ]
 
     @property

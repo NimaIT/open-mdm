@@ -1,183 +1,381 @@
-# Example MDM data models.
+# Demo MDM data models — aligned to the four functional-requirement use cases.
 #
-# Import with:
-#   curl -X POST "$BASE/api/v1/models/import?dry_run=false" \
-#        -b cookies.txt -F "file=@examples/models.yaml"
+# Four governance domains, each mapping to one use case:
+#   entity_metadata  (UC-1)  automated ingestion + DQ pipeline + mastering
+#   classification   (UC-2)  governed metadata management via workflow
+#   reference_data   (UC-3)  periodic bulk reference / forecast loads
+#   lookups          (UC-4)  static category -> grouping lookups
 #
-# Importing only writes definitions. Publish each entity afterwards to create
-# the physical landing / staging / live / history tables.
+# Every capability the platform supports is exercised here: cross-entity
+# `reference` attributes (FK + human-value resolution), an `association`
+# (junction) entity for M2M, enum -> CHECK constraints, custom transforms,
+# normalization rules, per-domain approval policy and business/match keys.
+#
+# Importing only writes definitions. Publish each entity to create the physical
+# landing / staging / live / history tables (scripts/seed_demo.py does both).
 mdm_schema_version: "1.0"
 
 entities:
-  # ─────────────────────────────────────────────────────────────── customer
-  - name: customer
-    display_name: Customer Master
-    domain: party
-    description: Golden customer records consolidated from CRM and ERP.
+  # ══════════════════════════════════ DOMAIN: entity_metadata (UC-1) ═════════
+  # High-frequency automated ingestion of service/entity metadata from legacy
+  # systems, with a data-quality pipeline, reference resolution and mastering.
+
+  # ─────────────────────────────────────────────────────────────────── owner
+  - name: owner
+    display_name: Owner
+    domain: entity_metadata
+    description: >-
+      Accountable owner (a team, an individual, or an external vendor) that a
+      service can be mastered against. A reference target for service.owner_id.
+    kind: master
     requires_approval: true
     soft_delete: true
     attributes:
-      - name: customer_code
-        display_name: Customer Code
-        description: Immutable business identifier assigned by the source system.
+      - name: owner_code
+        display_name: Owner Code
+        description: Immutable business identifier for the owner.
         data_type: string
         length: 40
         is_required: true
         is_unique: true
         is_business_key: true
         normalization: [trim, upper]
-      - name: legal_name
-        display_name: Legal Name
+      - name: name
+        display_name: Owner Name
+        data_type: string
+        length: 200
+        is_required: true
+        is_match_key: true
+        normalization: [trim, collapse_whitespace]
+      - name: email
+        display_name: Contact Email
+        data_type: email
+        is_pii: true
+        normalization: [trim, lower]
+      - name: owner_type
+        display_name: Owner Type
+        data_type: enum
+        length: 20
+        validation:
+          enum: [team, individual, vendor]
+
+  # ──────────────────────────────────────────────────────────────── timezone
+  - name: timezone
+    display_name: Timezone
+    domain: entity_metadata
+    description: >-
+      IANA timezone reference table — the source of truth the pipeline resolves
+      service.timezone_code against (DM-5).
+    kind: reference
+    requires_approval: false
+    soft_delete: true
+    attributes:
+      - name: tz_code
+        display_name: Timezone Code
+        description: IANA timezone identifier, e.g. "Australia/Sydney".
+        data_type: string
+        length: 64
+        is_required: true
+        is_unique: true
+        is_business_key: true
+        normalization: [trim]
+      - name: display_name
+        display_name: Display Name
+        data_type: string
+        length: 120
+        normalization: [trim, collapse_whitespace]
+      - name: utc_offset
+        display_name: UTC Offset
+        description: Standard-time offset from UTC, e.g. "+10:00".
+        data_type: string
+        length: 10
+        normalization: [trim]
+
+  # ────────────────────────────────────────────────────────────── capability
+  - name: capability
+    display_name: Capability
+    domain: entity_metadata
+    description: >-
+      A business/technical capability a service can provide. Linked to services
+      many-to-many through the service_capability junction (DM-3).
+    kind: reference
+    requires_approval: false
+    soft_delete: true
+    attributes:
+      - name: capability_code
+        display_name: Capability Code
+        data_type: string
+        length: 40
+        is_required: true
+        is_unique: true
+        is_business_key: true
+        normalization: [trim, upper]
+      - name: name
+        display_name: Capability Name
+        data_type: string
+        length: 200
+        is_required: true
+        is_match_key: true
+        normalization: [trim, collapse_whitespace]
+
+  # ───────────────────────────────────────────────────────────────── service
+  - name: service
+    display_name: Service
+    domain: entity_metadata
+    description: >-
+      The high-frequency mastered entity ingested from legacy CMDBs. Carries
+      cross-entity references to its owner and timezone, enum-constrained
+      lifecycle/criticality, a costed decimal, and a transform-cleansed
+      description.
+    kind: master
+    requires_approval: true
+    soft_delete: true
+    attributes:
+      - name: service_code
+        display_name: Service Code
+        data_type: string
+        length: 40
+        is_required: true
+        is_unique: true
+        is_business_key: true
+        normalization: [trim, upper]
+      - name: name
+        display_name: Service Name
         data_type: string
         length: 250
         is_required: true
         is_match_key: true
         normalization: [trim, collapse_whitespace]
-      - name: trading_name
-        display_name: Trading Name
-        data_type: string
-        length: 250
-        normalization: [trim, collapse_whitespace]
-      - name: tax_id
-        display_name: Tax / ABN
-        data_type: string
-        length: 30
+      - name: owner_id
+        display_name: Owner
+        description: >-
+          Reference to owner. Inbound writes carry the human-readable owner_code;
+          the pipeline resolves it to the parent golden mdm_id (DQ-2). An
+          unresolved owner holds the row invalid as a broken_reference (DQ-5).
+        data_type: reference
+        ref_entity: owner
+        ref_attribute: owner_code
+        is_required: true
         is_indexed: true
-        is_pii: true
-        normalization: [trim, digits_only]
-      - name: email
-        display_name: Primary Email
-        data_type: email
-        is_pii: true
-        normalization: [trim, lower]
-      - name: phone
-        display_name: Phone
-        data_type: string
-        length: 40
-        is_pii: true
-        normalization: [trim, digits_only]
-      - name: country
-        display_name: Country
+      - name: timezone_code
+        display_name: Timezone
+        description: Reference to timezone, resolved by tz_code.
+        data_type: reference
+        ref_entity: timezone
+        ref_attribute: tz_code
+        is_indexed: true
+      - name: lifecycle
+        display_name: Lifecycle
         data_type: enum
-        length: 2
+        length: 20
         validation:
-          enum: [AU, NZ, US, GB, DE, SG, JP]
-      - name: credit_limit
-        display_name: Credit Limit
+          enum: [planned, active, deprecated, retired]
+      - name: criticality
+        display_name: Criticality
+        data_type: enum
+        length: 20
+        validation:
+          enum: [low, medium, high, critical]
+      - name: monthly_cost
+        display_name: Monthly Cost
         data_type: decimal
         numeric_precision: 14
         numeric_scale: 2
         validation:
           min: 0
-      - name: segment
-        display_name: Segment
+      - name: description
+        display_name: Description
+        description: Free-text description; a trim transform cleanses it (EX-2).
+        data_type: text
+        transforms: [trim]
+      - name: is_public
+        display_name: Publicly Listed
+        data_type: boolean
+        default_value: "false"
+
+  # ──────────────────────────────────────────────────────── service_capability
+  - name: service_capability
+    display_name: Service Capability
+    domain: entity_metadata
+    description: >-
+      Junction entity giving services a many-to-many link to capabilities
+      (DM-3). A composite partial-unique index prevents duplicate edges.
+    kind: association
+    requires_approval: false
+    soft_delete: true
+    attributes:
+      - name: service_id
+        display_name: Service
+        data_type: reference
+        ref_entity: service
+        ref_attribute: service_code
+        is_required: true
+        is_indexed: true
+      - name: capability_id
+        display_name: Capability
+        data_type: reference
+        ref_entity: capability
+        ref_attribute: capability_code
+        is_required: true
+        is_indexed: true
+
+  # ══════════════════════════════════ DOMAIN: classification (UC-2) ══════════
+  # Semi-frequent, workflow-governed edits to cataloguing metadata by business
+  # users. requires_approval drives the editor -> approver maker-checker loop.
+
+  # ─────────────────────────────────────────────────────────── classification
+  - name: classification
+    display_name: Data Classification
+    domain: classification
+    description: >-
+      Governance classification applied to a service, edited through the
+      maker-checker workflow (GC-1). References the service it classifies.
+    kind: master
+    requires_approval: true
+    soft_delete: true
+    attributes:
+      - name: class_code
+        display_name: Classification Code
+        data_type: string
+        length: 40
+        is_required: true
+        is_unique: true
+        is_business_key: true
+        normalization: [trim, upper]
+      - name: name
+        display_name: Classification Name
+        data_type: string
+        length: 200
+        is_required: true
+        is_match_key: true
+        normalization: [trim, collapse_whitespace]
+      - name: sensitivity
+        display_name: Sensitivity
         data_type: enum
         length: 20
         validation:
-          enum: [enterprise, mid_market, smb, government]
-      - name: onboarded_on
-        display_name: Onboarded On
-        data_type: date
-      - name: is_active
-        display_name: Active
-        data_type: boolean
-        default_value: "true"
+          enum: [public, internal, confidential, restricted]
+      - name: service_id
+        display_name: Service
+        description: Reference to the classified service, resolved by service_code.
+        data_type: reference
+        ref_entity: service
+        ref_attribute: service_code
+        is_indexed: true
+      - name: description
+        display_name: Description
+        data_type: text
+        transforms: [trim]
 
-  # ──────────────────────────────────────────────────────────────── product
-  - name: product
-    display_name: Product Master
-    domain: catalog
-    description: Sellable products and services.
-    requires_approval: true
+  # ══════════════════════════════════ DOMAIN: reference_data (UC-3) ══════════
+  # Annual / rare bulk loads of domain reference + forecast data.
+
+  # ─────────────────────────────────────────────────────────────────── region
+  - name: region
+    display_name: Region
+    domain: reference_data
+    description: >-
+      Geographic region reference table, grouped under a super-region. A
+      reference target for demand_forecast (DM-5).
+    kind: reference
+    requires_approval: false
     soft_delete: true
     attributes:
-      - name: sku
-        display_name: SKU
+      - name: region_code
+        display_name: Region Code
         data_type: string
-        length: 40
+        length: 20
         is_required: true
         is_unique: true
         is_business_key: true
         normalization: [trim, upper]
-      - name: product_name
-        display_name: Product Name
+      - name: name
+        display_name: Region Name
         data_type: string
-        length: 300
+        length: 120
         is_required: true
-        is_match_key: true
         normalization: [trim, collapse_whitespace]
-      - name: category
-        display_name: Category
+      - name: super_region
+        display_name: Super Region
         data_type: enum
-        length: 40
+        length: 10
         validation:
-          enum: [hardware, software, service, subscription]
-      - name: unit_price
-        display_name: Unit Price
+          enum: [APAC, EMEA, AMER]
+
+  # ────────────────────────────────────────────────────────── demand_forecast
+  - name: demand_forecast
+    display_name: Demand Forecast
+    domain: reference_data
+    description: >-
+      Forecast values loaded in periodic bulk batches. The business key is a
+      composite of a region reference and the forecast period (year), so one
+      region carries one forecast per period per scenario.
+    kind: master
+    requires_approval: false
+    soft_delete: true
+    attributes:
+      - name: region_code
+        display_name: Region
+        description: Reference to region (part of the composite business key).
+        data_type: reference
+        ref_entity: region
+        ref_attribute: region_code
+        is_required: true
+        is_business_key: true
+        is_indexed: true
+      - name: period
+        display_name: Period (Year)
+        data_type: integer
+        is_required: true
+        is_business_key: true
+        validation:
+          min: 2000
+          max: 2100
+      - name: forecast_value
+        display_name: Forecast Value
         data_type: decimal
-        numeric_precision: 12
+        numeric_precision: 16
         numeric_scale: 2
         validation:
           min: 0
-      - name: currency
-        display_name: Currency
+      - name: scenario
+        display_name: Scenario
         data_type: enum
-        length: 3
-        default_value: AUD
+        length: 10
         validation:
-          enum: [AUD, NZD, USD, GBP, EUR]
-      - name: launch_date
-        display_name: Launch Date
-        data_type: date
-      - name: specifications
-        display_name: Specifications
-        description: Free-form attributes that vary by category.
-        data_type: json
-      - name: discontinued
-        display_name: Discontinued
-        data_type: boolean
-        default_value: "false"
+          enum: [base, high, low]
 
-  # ───────────────────────────────────────────────────────────────── vendor
-  - name: vendor
-    display_name: Vendor Master
-    domain: party
-    description: Approved suppliers and their payment terms.
-    requires_approval: true
+  # ══════════════════════════════════ DOMAIN: lookups (UC-4) ═════════════════
+  # Very rarely changed static lookups that map a category to a grouping.
+
+  # ────────────────────────────────────────────────────────────── status_code
+  - name: status_code
+    display_name: Status Code
+    domain: lookups
+    description: >-
+      Static lookup mapping a status category to an operational grouping
+      (open / closed / pending) — the UC-4 category-to-grouping pattern (DM-5).
+    kind: reference
+    requires_approval: false
     soft_delete: true
     attributes:
-      - name: vendor_code
-        display_name: Vendor Code
+      - name: code
+        display_name: Code
         data_type: string
-        length: 30
+        length: 40
         is_required: true
         is_unique: true
         is_business_key: true
         normalization: [trim, upper]
-      - name: legal_name
-        display_name: Legal Name
+      - name: label
+        display_name: Label
         data_type: string
-        length: 250
+        length: 120
         is_required: true
-        is_match_key: true
         normalization: [trim, collapse_whitespace]
-      - name: contact_email
-        display_name: Accounts Payable Email
-        data_type: email
-        normalization: [trim, lower]
-      - name: country
-        display_name: Country
+      - name: grouping
+        display_name: Grouping
         data_type: enum
-        length: 2
+        length: 10
         validation:
-          enum: [AU, NZ, US, GB, DE, SG, CN]
-      - name: payment_terms_days
-        display_name: Payment Terms (days)
-        data_type: integer
-        validation:
-          min: 0
-          max: 180
-      - name: is_approved
-        display_name: Approved Supplier
-        data_type: boolean
-        default_value: "false"
+          enum: [open, closed, pending]

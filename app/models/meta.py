@@ -9,6 +9,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -48,9 +49,13 @@ class UserSource(str, enum.Enum):
 
 class Role(str, enum.Enum):
     ADMIN = "admin"
-    STEWARD = "steward"
+    STEWARD = "steward"        # legacy = editor + approver (unchanged)
     READER = "reader"
     SERVICE = "service"
+    # Workstream 2 — finer-grained human roles that split the legacy steward.
+    EDITOR = "editor"          # writes via the workflow only; cannot approve
+    APPROVER = "approver"      # reviews and decides; does not submit data
+    POWER_USER = "power_user"  # editor + authorised direct-to-live edits
 
 
 class TimestampMixin:
@@ -85,6 +90,10 @@ class Entity(TimestampMixin, Base):
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=True)
     domain: Mapped[str] = mapped_column(String(100), nullable=True)
+    # Entity role: 'master' (a golden-record entity), 'reference' (a lookup /
+    # source-of-truth table) or 'association' (a junction table for a
+    # many-to-many via two reference attributes).
+    kind: Mapped[str] = mapped_column(String(20), default="master", nullable=False)
     status: Mapped[str] = mapped_column(
         String(20), default=EntityStatus.DRAFT.value, nullable=False
     )
@@ -123,6 +132,48 @@ class Entity(TimestampMixin, Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Entity {self.name} v{self.version} {self.status}>"
+
+
+class Domain(TimestampMixin, Base):
+    """A logical governance / access boundary that groups entities.
+
+    A domain is *not* a separate PostgreSQL schema. The four tier-schemas
+    (``mdm_landing`` / ``mdm_staging`` / ``mdm`` / ``mdm_history``) are shared by
+    every entity regardless of domain — carving a physical schema per domain
+    would fracture the tier model. A domain is instead the unit that
+
+      * scopes per-domain authorisation (see ``User.domain_permissions`` and
+        the ``domain`` column on ``GroupRoleMapping``), and
+      * supplies lifecycle DEFAULTS an entity inherits when it leaves the
+        corresponding field unset (``requires_approval``, ``retention_days``,
+        ``default_soft_delete``).
+
+    ``Entity.domain`` references ``Domain.name`` by convention (no hard FK, so a
+    domain can be renamed or an entity can name a not-yet-created domain without
+    a constraint violation).
+    """
+
+    __tablename__ = "domain"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_domain_name"),
+        CheckConstraint("name ~ '^[a-z][a-z0-9_]*$'", name="ck_domain_name_snake"),
+        META,
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_col(primary_key=True)
+    name: Mapped[str] = mapped_column(String(63), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=True)
+
+    # Lifecycle defaults inherited by member entities when their own value is
+    # unset. Kept deliberately small — a domain is a policy boundary, not a
+    # second copy of the entity model.
+    requires_approval: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    retention_days: Mapped[int] = mapped_column(Integer, nullable=True)
+    default_soft_delete: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<Domain {self.name}>"
 
 
 class Attribute(TimestampMixin, Base):
@@ -164,6 +215,11 @@ class Attribute(TimestampMixin, Base):
     validation: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     # Normalisation applied before matching: trim, lower, upper, strip_punctuation
     normalization: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
+    # Extensibility (EX-2): ordered custom transforms applied AFTER normalisation
+    # and coercion. Each item is a name (str) or {"fn": name, ...params}.
+    transforms: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default="[]", nullable=False
+    )
 
     # Optional reference to another entity (lookup / FK)
     ref_entity: Mapped[str] = mapped_column(String(63), nullable=True)
@@ -173,6 +229,43 @@ class Attribute(TimestampMixin, Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Attribute {self.name}:{self.data_type}>"
+
+
+class FieldMapping(TimestampMixin, Base):
+    """Source-schema -> target-schema field mapping (EX-3).
+
+    Applied during promotion (landing -> staging), keyed by the landing row's
+    ``mdm_source_system`` (``NULL`` == applies to every source). Renames
+    ``source_field`` to ``target_field`` with an optional transform spec and an
+    optional default. This is metadata only — it never changes the raw landing
+    payload (capture-first).
+    """
+
+    __tablename__ = "field_mapping"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_system", "entity_name", "source_field", "target_field",
+            name="uq_field_mapping",
+        ),
+        Index("ix_field_mapping_entity", "entity_name"),
+        Index("ix_field_mapping_source_system", "source_system"),
+        META,
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_col(primary_key=True)
+    # NULL == applies to all source systems.
+    source_system: Mapped[str] = mapped_column(String(100), nullable=True)
+    entity_name: Mapped[str] = mapped_column(String(63), nullable=False)
+    source_field: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_field: Mapped[str] = mapped_column(String(63), nullable=False)
+    # Optional transform spec (str name, {"fn": name, ...}, or a list of those).
+    transform: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    default_value: Mapped[str] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (f"<FieldMapping {self.entity_name} {self.source_field}"
+                f"->{self.target_field}>")
 
 
 class ModelVersion(Base):
@@ -220,6 +313,17 @@ class User(TimestampMixin, Base):
     roles: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
     # Optional per-entity overrides: {"customer": ["read","write"]}
     entity_permissions: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    # Optional per-domain overrides: {"finance": ["read","write","approve"]}.
+    # Consulted after entity_permissions and before the global role permission
+    # (see can_access_entity). Empty map == no restriction, fall through.
+    # This is a RESTRICTION layer (narrows an already-granted capability).
+    domain_permissions: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    # Optional per-domain ROLE grants: {"finance": ["editor","approver"]}.
+    # Unlike domain_permissions, this is a CONFERRAL layer: it GRANTS the listed
+    # roles' permissions *within that domain only*, so a user with no global roles
+    # can act inside their granted domain and nowhere else (AC-3). Evaluated by
+    # effective_permissions(); empty map == no conferral, identical to before.
+    domain_roles: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_login_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -244,6 +348,10 @@ class GroupRoleMapping(TimestampMixin, Base):
     id: Mapped[uuid.UUID] = _uuid_col(primary_key=True)
     group_dn: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Optional domain the grant is confined to. NULL == a global role grant,
+    # which is the only shape legacy mappings have — so existing behaviour is
+    # unchanged. A non-null domain grants the role *within that domain only*.
+    domain: Mapped[str] = mapped_column(String(63), nullable=True)
     description: Mapped[str] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
@@ -260,6 +368,11 @@ class ApiKey(TimestampMixin, Base):
     key_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     source_system: Mapped[str] = mapped_column(String(100), nullable=True)
     allowed_entities: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
+    # AC-4 privilege elevation. An elevated key gets cross-domain *write* reach
+    # (all domains, or those in allowed_domains) that no human role is given —
+    # but never approval power: the service role still lacks staging:approve.
+    elevated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    allowed_domains: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -291,6 +404,159 @@ class AuditEvent(Base):
     after_value: Mapped[dict] = mapped_column(JSONB, nullable=True)
     ip_address: Mapped[str] = mapped_column(String(64), nullable=True)
     success: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+# ----------------------------------------------------- governed change workflow
+class WorkflowTask(TimestampMixin, Base):
+    """The governance state of one staging change request (Workstream 3).
+
+    The generated staging row remains the *data*; this row is the *decision
+    state* — its status, assignment, submission rationale and (via
+    ``WorkflowEvent``) its full, unfragmented history. There is exactly one task
+    per staging row. ``staging_id`` is a plain bigint, not a real FK, because the
+    staging table is generated per entity and unknown at import time.
+    """
+
+    __tablename__ = "workflow_task"
+    __table_args__ = (
+        UniqueConstraint("entity_name", "staging_id", name="uq_workflow_task_staging"),
+        Index("ix_workflow_task_status", "status"),
+        Index("ix_workflow_task_entity", "entity_name"),
+        Index("ix_workflow_task_assigned", "assigned_to"),
+        Index("ix_workflow_task_claimed", "claimed_by"),
+        META,
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_col(primary_key=True)
+    entity_name: Mapped[str] = mapped_column(String(63), nullable=False)
+    staging_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    domain: Mapped[str] = mapped_column(String(100), nullable=True)
+    # pending_review|changes_requested|rejected|applied|terminated
+    status: Mapped[str] = mapped_column(
+        String(32), default="pending_review", nullable=False
+    )
+    submitted_by: Mapped[str] = mapped_column(String(255), nullable=True)
+    submit_rationale: Mapped[str] = mapped_column(Text, nullable=True)
+    assigned_to: Mapped[str] = mapped_column(String(255), nullable=True)
+    claimed_by: Mapped[str] = mapped_column(String(255), nullable=True)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    change_type: Mapped[str] = mapped_column(String(20), nullable=True)
+
+    events: Mapped[list["WorkflowEvent"]] = relationship(
+        back_populates="task", order_by="WorkflowEvent.seq", lazy="selectin"
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<WorkflowTask {self.entity_name}#{self.staging_id} {self.status}>"
+
+
+class WorkflowEvent(Base):
+    """One immutable step in a change request's decision chain (Workstream 3).
+
+    Append-only at the database level: a BEFORE UPDATE OR DELETE trigger
+    (installed by bootstrap) rejects any mutation, so history cannot be rewritten
+    even by the application (AO-2).
+    """
+
+    __tablename__ = "workflow_event"
+    __table_args__ = (
+        UniqueConstraint("task_id", "seq", name="uq_workflow_event_seq"),
+        Index("ix_workflow_event_task", "task_id"),
+        META,
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_col(primary_key=True)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{settings.SCHEMA_META}.workflow_task.id"),
+        nullable=False,
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    # submit|claim|release|edit|request_changes|approve|reject|reassign|terminate|apply
+    step: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor: Mapped[str] = mapped_column(String(255), nullable=True)
+    actor_roles: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
+    comment: Mapped[str] = mapped_column(Text, nullable=True)
+    from_status: Mapped[str] = mapped_column(String(32), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(32), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    ip_address: Mapped[str] = mapped_column(String(64), nullable=True)
+
+    task: Mapped["WorkflowTask"] = relationship(back_populates="events")
+
+
+# ------------------------------------------------------------- notifications
+class NotificationTemplate(TimestampMixin, Base):
+    """Per-domain (or global) template for a workflow-transition notification (W4).
+
+    ``domain`` NULL means the global default used for any domain lacking a
+    specific row. ``event`` is one of the workflow transitions notifications are
+    sent at. ``recipients`` is an explicit jsonb list of email addresses; when
+    empty, recipients are resolved by role scoped to the domain. ``subject`` and
+    ``body`` are ``str.format``-style templates rendered over a safe context.
+    """
+
+    __tablename__ = "notification_template"
+    __table_args__ = (
+        UniqueConstraint("domain", "event", name="uq_notification_template_de"),
+        Index("ix_notification_template_event", "event"),
+        META,
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_col(primary_key=True)
+    # NULL == the global default for this event.
+    domain: Mapped[str] = mapped_column(String(100), nullable=True)
+    # submitted|changes_requested|rejected|approved|terminated
+    event: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    # Explicit recipient emails; empty list == resolve by role for the domain.
+    recipients: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
+    # Optional per-domain From override (else settings.NOTIFICATION_FROM).
+    from_address: Mapped[str] = mapped_column(String(320), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class Notification(Base):
+    """A single notification — the dev outbox AND the delivery queue (W4).
+
+    A row is inserted (status ``queued`` or ``skipped``) after a workflow
+    transition commits. ``dispatch`` later moves it to ``sent`` / ``failed``.
+    """
+
+    __tablename__ = "notification"
+    __table_args__ = (
+        Index("ix_notification_status", "status"),
+        Index("ix_notification_domain", "domain"),
+        Index("ix_notification_event", "event"),
+        Index("ix_notification_created_at", "created_at"),
+        META,
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_col(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    event: Mapped[str] = mapped_column(String(32), nullable=False)
+    domain: Mapped[str] = mapped_column(String(100), nullable=True)
+    entity_name: Mapped[str] = mapped_column(String(63), nullable=True)
+    staging_id: Mapped[int] = mapped_column(BigInteger, nullable=True)
+    task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=True)
+    to_addresses: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
+    from_address: Mapped[str] = mapped_column(String(320), nullable=True)
+    subject: Mapped[str] = mapped_column(Text, nullable=True)
+    body: Mapped[str] = mapped_column(Text, nullable=True)
+    deep_link: Mapped[str] = mapped_column(Text, nullable=True)
+    # queued|sent|failed|skipped
+    status: Mapped[str] = mapped_column(
+        String(20), default="queued", nullable=False
+    )
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class PromotionBatch(Base):

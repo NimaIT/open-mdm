@@ -338,6 +338,65 @@ class TestDataRoutes:
         assert r.status_code == 422
 
 
+class TestOptionsRoute:
+    """GET /data/{entity}/options — the FK/reference dropdown source (UI-3)."""
+
+    def _seed(self, client, headers, ent, code, label):
+        """Land + directly apply a valid record so it reaches the golden tier."""
+        r = client.post(
+            f"{API}/data/{ent.name}?direct=true",
+            headers=headers,
+            json={"code": code, "label": label, "amount": "1",
+                  "category": "alpha"},
+        )
+        assert r.status_code == 202
+        assert r.json()["applied"] is True, r.json()
+
+    def test_options_returns_id_and_label(self, client, principals,
+                                          entity_factory):
+        ent = entity_factory()
+        h = principals["api_admin"]
+        self._seed(client, h, ent, "acme", "Acme Corp")
+        r = client.get(f"{API}/data/{ent.name}/options", headers=h)
+        assert r.status_code == 200
+        opts = r.json()
+        assert isinstance(opts, list) and len(opts) == 1
+        assert set(opts[0]) == {"mdm_id", "label"}
+        # Label is the business-key value (code), not the uuid.
+        assert opts[0]["label"] == "ACME"  # normalization trims + uppercases code
+        uuid.UUID(opts[0]["mdm_id"])  # a real uuid
+
+    def test_options_query_filters_label(self, client, principals,
+                                         entity_factory):
+        ent = entity_factory()
+        h = principals["api_admin"]
+        self._seed(client, h, ent, "alpha", "One")
+        self._seed(client, h, ent, "bravo", "Two")
+        r = client.get(f"{API}/data/{ent.name}/options?q=alph", headers=h)
+        assert r.status_code == 200
+        labels = [o["label"] for o in r.json()]
+        assert labels == ["ALPHA"]
+
+    def test_options_requires_read_access(self, client, principals,
+                                          entity_factory):
+        ent = entity_factory()
+        r = client.get(f"{API}/data/{ent.name}/options",
+                       headers=principals["api_norole"])
+        assert r.status_code == 403
+
+    def test_options_excludes_deleted(self, client, principals, entity_factory):
+        ent = entity_factory()
+        h = principals["api_admin"]
+        self._seed(client, h, ent, "keepme", "Keep")
+        opts = client.get(f"{API}/data/{ent.name}/options", headers=h).json()
+        # Directly delete the record and confirm it drops out of options.
+        rid = opts[0]["mdm_id"]
+        d = client.delete(f"{API}/data/{ent.name}/{rid}?direct=true", headers=h)
+        assert d.status_code == 202
+        opts2 = client.get(f"{API}/data/{ent.name}/options", headers=h).json()
+        assert all(o["mdm_id"] != rid for o in opts2)
+
+
 class TestServiceKeyRoutes:
     @pytest.fixture
     def key(self, db):
@@ -416,7 +475,7 @@ class TestStewardshipRoutes:
                           {"code": "q3", "label": "", "category": "bad"})
         r = client.post(
             f"{API}/stewardship/{ent.name}/staging/{sid}/approve",
-            headers=principals["api_steward"], json={},
+            headers=principals["api_steward"], json={"note": "approving"},
         )
         assert r.status_code == 400
         assert "validation errors" in r.json()["detail"]
@@ -430,7 +489,7 @@ class TestStewardshipRoutes:
                            "category": "alpha"})
         r = client.post(
             f"{API}/stewardship/{ent.name}/staging/{sid}/approve",
-            headers=principals["api_steward"], json={},
+            headers=principals["api_steward"], json={"note": "approving"},
         )
         assert r.status_code == 403
         assert "segregation of duties" in r.json()["detail"].lower()
@@ -469,6 +528,6 @@ class TestStewardshipRoutes:
                           {"code": "q8", "label": "", "category": "nope"})
         r = client.post(f"{API}/stewardship/{ent.name}/staging/bulk-approve",
                         headers=principals["api_steward"],
-                        json={"staging_ids": [good, bad]})
+                        json={"staging_ids": [good, bad], "note": "bulk ok"})
         body = r.json()
         assert body["approved"] == 1 and body["failed"] == 1

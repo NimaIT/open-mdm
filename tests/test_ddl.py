@@ -193,7 +193,8 @@ class TestDrop:
     def test_drop_plan_is_always_destructive(self):
         plan = build_drop_plan("some_entity")
         assert plan.is_destructive
-        assert len(plan.destructive) == 4
+        # four tier tables plus the distribution matview (W5).
+        assert len(plan.destructive) == 5
 
 
 class TestPlanSerialisation:

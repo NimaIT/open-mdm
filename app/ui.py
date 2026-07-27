@@ -17,6 +17,8 @@ STATIC = Path(__file__).parent / "static"
 
 @router.get("/", response_class=HTMLResponse)
 @router.get("/login", response_class=HTMLResponse)
+@router.get("/inbox", response_class=HTMLResponse)
+@router.get("/inbox/{rest:path}", response_class=HTMLResponse)
 @router.get("/models", response_class=HTMLResponse)
 @router.get("/models/{rest:path}", response_class=HTMLResponse)
 @router.get("/review", response_class=HTMLResponse)

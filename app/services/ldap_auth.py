@@ -54,6 +54,9 @@ class DirectoryUser:
     display_name: Optional[str] = None
     groups: List[str] = field(default_factory=list)
     roles: List[str] = field(default_factory=list)
+    # Domain-scoped role grants: {domain: [role, ...]}. Empty for legacy
+    # (global-only) mappings, which keeps behaviour identical to before.
+    domain_roles: Dict[str, List[str]] = field(default_factory=dict)
     raw: Dict = field(default_factory=dict)
 
 
@@ -188,16 +191,27 @@ def _normalize_dn(dn: str) -> str:
     return re.sub(r"\s*,\s*", ",", (dn or "").strip().lower())
 
 
-def map_roles(group_dns: List[str], mappings: Optional[List[Tuple[str, str]]] = None) -> List[str]:
-    """Map directory groups onto application roles.
+def _mapping_parts(mapping) -> Tuple[str, str, Optional[str]]:
+    """Unpack a mapping that may be a ``(dn, role)`` pair or a
+    ``(dn, role, domain)`` triple. A missing domain means a global grant."""
+    if len(mapping) >= 3:
+        return mapping[0], mapping[1], mapping[2]
+    return mapping[0], mapping[1], None
+
+
+def map_roles(group_dns: List[str], mappings: Optional[List[Tuple]] = None) -> List[str]:
+    """Map directory groups onto GLOBAL application roles.
 
     ``mappings`` comes from the database (admin-editable); the environment
-    variables act as the bootstrap fallback.
+    variables act as the bootstrap fallback. Each mapping may be a
+    ``(dn, role)`` pair (legacy / global) or a ``(dn, role, domain)`` triple —
+    only the domain-less (global) grants contribute here. Domain-scoped grants
+    are resolved separately by ``map_domain_roles``.
     """
     normalized = {_normalize_dn(g) for g in group_dns}
     roles: set = set()
 
-    pairs: List[Tuple[str, str]] = list(mappings or [])
+    pairs: List[Tuple] = list(mappings or [])
     if not pairs:
         for dn, role in (
             (settings.LDAP_ADMIN_GROUP_DN, Role.ADMIN.value),
@@ -207,11 +221,30 @@ def map_roles(group_dns: List[str], mappings: Optional[List[Tuple[str, str]]] = 
             if dn:
                 pairs.append((dn, role))
 
-    for dn, role in pairs:
-        if _normalize_dn(dn) in normalized:
+    for mapping in pairs:
+        dn, role, domain = _mapping_parts(mapping)
+        if domain is None and _normalize_dn(dn) in normalized:
             roles.add(role)
 
     return sorted(roles)
+
+
+def map_domain_roles(
+    group_dns: List[str], mappings: Optional[List[Tuple]] = None
+) -> Dict[str, List[str]]:
+    """Resolve DOMAIN-scoped group grants into ``{domain: [role, ...]}``.
+
+    Only mappings that carry a non-null domain contribute. Global (domain-less)
+    grants are ignored here — they are handled by ``map_roles`` — so a directory
+    with no domain-scoped mappings yields ``{}`` and nothing changes.
+    """
+    normalized = {_normalize_dn(g) for g in group_dns}
+    out: Dict[str, set] = {}
+    for mapping in (mappings or []):
+        dn, role, domain = _mapping_parts(mapping)
+        if domain and _normalize_dn(dn) in normalized:
+            out.setdefault(domain, set()).add(role)
+    return {d: sorted(r) for d, r in out.items()}
 
 
 def authenticate(
@@ -268,6 +301,7 @@ def authenticate(
                 pass
 
         roles = map_roles(groups, mappings)
+        domain_roles = map_domain_roles(groups, mappings)
 
         def _first(key: str) -> Optional[str]:
             v = attrs.get(key)
@@ -282,6 +316,7 @@ def authenticate(
             display_name=_first(settings.LDAP_ATTR_DISPLAY_NAME),
             groups=groups,
             roles=roles,
+            domain_roles=domain_roles,
             raw={k: v for k, v in attrs.items() if k != "memberOf"},
         )
     finally:

@@ -21,21 +21,25 @@ from app.services.identifiers import (
 
 SCHEMA_VERSION = "1.0"
 
+# Entity kinds accepted on import — mirrors EntityIn._known_kind in the API.
+_ALLOWED_KINDS = {"master", "reference", "association"}
+
 ATTR_FIELDS = (
     "name", "display_name", "description", "data_type", "length",
     "numeric_precision", "numeric_scale", "is_required", "is_unique",
     "is_business_key", "is_match_key", "is_indexed", "is_pii",
-    "default_value", "validation", "normalization", "ref_entity", "ref_attribute",
+    "default_value", "validation", "normalization", "transforms",
+    "ref_entity", "ref_attribute",
 )
 ENTITY_FIELDS = (
-    "name", "display_name", "description", "domain", "requires_approval",
+    "name", "display_name", "description", "domain", "kind", "requires_approval",
     "soft_delete", "auto_approve_threshold", "retention_days",
 )
 
 
 # ------------------------------------------------------------------- export
 def entity_to_dict(entity: Entity, *, include_runtime: bool = False) -> Dict:
-    doc: Dict = {f: getattr(entity, f) for f in ENTITY_FIELDS}
+    doc: Dict = {f: getattr(entity, f, None) for f in ENTITY_FIELDS}
     doc["attributes"] = [
         {f: getattr(a, f) for f in ATTR_FIELDS} for a in
         sorted(entity.attributes, key=lambda a: a.position)
@@ -123,6 +127,16 @@ def validate_document(doc: Dict) -> Tuple[List[Dict], List[str]]:
             continue
         seen_names.add(name)
 
+        # Validate entity kind against the same contract the API enforces, so a
+        # bad value from YAML/JSON is rejected up front rather than reaching DDL.
+        kind = str(raw.get("kind") or "master").lower()
+        if kind not in _ALLOWED_KINDS:
+            errors.append(
+                f"{label}: invalid kind '{kind}'. Must be one of: "
+                f"{', '.join(sorted(_ALLOWED_KINDS))}."
+            )
+            continue
+
         attrs = raw.get("attributes")
         if not isinstance(attrs, list) or not attrs:
             errors.append(f"{label}: must define at least one attribute.")
@@ -153,6 +167,13 @@ def validate_document(doc: Dict) -> Tuple[List[Dict], List[str]]:
                 )
                 continue
 
+            if dtype == "reference" and not attr.get("ref_entity"):
+                errors.append(
+                    f"{label}.{aname}: a 'reference' attribute must specify "
+                    "ref_entity."
+                )
+                continue
+
             validation = attr.get("validation") or {}
             if not isinstance(validation, dict):
                 errors.append(f"{label}.{aname}: 'validation' must be a mapping.")
@@ -163,6 +184,12 @@ def validate_document(doc: Dict) -> Tuple[List[Dict], List[str]]:
             if not isinstance(normalization, list):
                 errors.append(f"{label}.{aname}: 'normalization' must be a list.")
                 normalization = []
+            transforms = attr.get("transforms") or []
+            if isinstance(transforms, (str, dict)):
+                transforms = [transforms]
+            if not isinstance(transforms, list):
+                errors.append(f"{label}.{aname}: 'transforms' must be a list.")
+                transforms = []
 
             clean = {
                 "name": aname,
@@ -181,6 +208,7 @@ def validate_document(doc: Dict) -> Tuple[List[Dict], List[str]]:
                 "default_value": attr.get("default_value"),
                 "validation": validation,
                 "normalization": normalization,
+                "transforms": transforms,
                 "ref_entity": attr.get("ref_entity"),
                 "ref_attribute": attr.get("ref_attribute"),
                 "position": a_idx,
@@ -203,6 +231,7 @@ def validate_document(doc: Dict) -> Tuple[List[Dict], List[str]]:
                 "display_name": raw.get("display_name") or name.replace("_", " ").title(),
                 "description": raw.get("description"),
                 "domain": raw.get("domain"),
+                "kind": kind,
                 "requires_approval": bool(raw.get("requires_approval", True)),
                 "soft_delete": bool(raw.get("soft_delete", True)),
                 "auto_approve_threshold": _int_or_none(raw.get("auto_approve_threshold")),

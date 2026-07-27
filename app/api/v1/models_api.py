@@ -16,8 +16,17 @@ from fastapi import (
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_entity, require_admin, require_permission
+from app.config import settings
 from app.db import get_db, get_ddl_engine
-from app.models import Attribute, AuditEvent, Entity, EntityStatus, ModelVersion, User
+from app.models import (
+    Attribute,
+    AuditEvent,
+    Domain,
+    Entity,
+    EntityStatus,
+    ModelVersion,
+    User,
+)
 from app.schemas.models import (
     EntityIn,
     EntityOut,
@@ -25,11 +34,15 @@ from app.schemas.models import (
     PublishRequest,
 )
 from app.services import bootstrap as bootstrap_svc
+from app.services import workflow
 from app.services.ddl import (
     apply_plan,
     build_alter_plan,
     build_create_plan,
     build_drop_plan,
+    reconcile_enum_constraints,
+    reconcile_matview,
+    reconcile_reference_constraints,
 )
 from app.services.identifiers import IdentifierError, validate_column_name, validate_ident
 from app.services.model_io import (
@@ -91,15 +104,33 @@ def create_entity(
             status_code=422, detail="An entity must define at least one attribute."
         )
 
+    # DM-1: an entity inherits its domain's lifecycle DEFAULTS for any field the
+    # caller did not explicitly send. `model_fields_set` tells us precisely which
+    # fields were provided, so an explicit value always wins over the domain.
+    requires_approval = payload.requires_approval
+    soft_delete = payload.soft_delete
+    retention_days = payload.retention_days
+    provided = payload.model_fields_set
+    if payload.domain:
+        dom = db.query(Domain).filter(Domain.name == payload.domain).one_or_none()
+        if dom is not None:
+            if "requires_approval" not in provided:
+                requires_approval = dom.requires_approval
+            if "soft_delete" not in provided:
+                soft_delete = dom.default_soft_delete
+            if "retention_days" not in provided:
+                retention_days = dom.retention_days
+
     entity = Entity(
         name=name,
         display_name=payload.display_name or name.replace("_", " ").title(),
         description=payload.description,
         domain=payload.domain,
-        requires_approval=payload.requires_approval,
-        soft_delete=payload.soft_delete,
+        kind=payload.kind,
+        requires_approval=requires_approval,
+        soft_delete=soft_delete,
         auto_approve_threshold=payload.auto_approve_threshold,
-        retention_days=payload.retention_days,
+        retention_days=retention_days,
         status=EntityStatus.DRAFT.value,
         created_by=principal.username,
         updated_by=principal.username,
@@ -150,6 +181,7 @@ def update_entity(
     entity.display_name = payload.display_name or entity.display_name
     entity.description = payload.description
     entity.domain = payload.domain
+    entity.kind = payload.kind
     entity.requires_approval = payload.requires_approval
     entity.soft_delete = payload.soft_delete
     entity.retention_days = payload.retention_days
@@ -253,6 +285,43 @@ def publish_entity(
     entity.published_at = datetime.utcnow()
     entity.updated_by = principal.username
 
+    # Reference foreign keys are wired up after the tables exist, from both
+    # directions (this entity's outbound refs + already-published children that
+    # reference it). This never aborts a publish — missing parents or violating
+    # data degrade to warnings.
+    reference_added: List[str] = []
+    try:
+        with engine.begin() as conn:
+            recon = reconcile_reference_constraints(
+                conn, entity, db.query(Entity).all()
+            )
+        reference_added = recon.get("added", [])
+        plan.warnings.extend(recon.get("warnings", []))
+    except Exception as exc:  # noqa: BLE001 — reference wiring is best-effort
+        plan.warnings.append(f"Reference-constraint reconciliation skipped: {exc}")
+
+    # Enum allow-list CHECKs are reconciled on the live tier so that editing or
+    # removing an enum on an already-published column updates the constraint.
+    try:
+        with engine.begin() as conn:
+            enum_recon = reconcile_enum_constraints(conn, entity)
+        plan.warnings.extend(enum_recon.get("warnings", []))
+    except Exception as exc:  # noqa: BLE001 — enum wiring is best-effort
+        plan.warnings.append(f"Enum-constraint reconciliation skipped: {exc}")
+
+    # Downstream distribution (DD-1): (re)create the mdm_pub materialized view.
+    # A matview's columns are fixed at creation, so this drops + recreates it to
+    # reflect any column change. Never hard-fails a publish — matview errors
+    # degrade to a warning, consistent with reference / enum reconciliation.
+    distribution_matview: List[str] = []
+    try:
+        with engine.begin() as conn:
+            mv_recon = reconcile_matview(conn, entity)
+        distribution_matview = mv_recon.get("created", [])
+        plan.warnings.extend(mv_recon.get("warnings", []))
+    except Exception as exc:  # noqa: BLE001 — distribution is best-effort
+        plan.warnings.append(f"Distribution matview reconciliation skipped: {exc}")
+
     # A ModelVersion row already exists for this version (written when the model
     # was created or updated). Publishing records the applied DDL against that
     # same snapshot instead of inserting a duplicate — a duplicate violates
@@ -295,11 +364,14 @@ def publish_entity(
         "status": entity.status,
         "statements_executed": result["executed"],
         "warnings": plan.warnings,
+        "reference_constraints_added": reference_added,
+        "distribution_matview": distribution_matview,
         "tiers": {
             "landing": f"mdm_landing.{entity.name}",
             "staging": f"mdm_staging.{entity.name}",
             "live": f"mdm.{entity.name}",
             "history": f"mdm_history.{entity.name}",
+            "distribution": f"{settings.SCHEMA_PUBLISH}.{entity.name}",
         },
     }
 
@@ -324,13 +396,22 @@ def delete_entity(
             apply_plan(conn, plan, allow_destructive=True)
         dropped = plan.statements
     name = entity.name
+    # Retire any active workflow tasks BEFORE the entity's metadata and tables
+    # disappear (MAJOR-1). Otherwise they dangle in the inbox / admin workflow
+    # views pointing at a staging table that no longer exists. This rides the same
+    # ORM transaction as the entity deletion, so both commit atomically.
+    terminated = workflow.terminate_tasks_for_entity(
+        db, name, actor=principal.username, reason="entity deleted"
+    )
     db.delete(entity)
     db.add(
         AuditEvent(actor=principal.username, actor_roles=principal.roles,
                    action="model_delete", entity_name=name, tier="meta",
-                   detail={"dropped_tables": bool(dropped)})
+                   detail={"dropped_tables": bool(dropped),
+                           "workflow_tasks_terminated": terminated})
     )
-    return {"entity": name, "deleted": True, "tables_dropped": dropped}
+    return {"entity": name, "deleted": True, "tables_dropped": dropped,
+            "workflow_tasks_terminated": terminated}
 
 
 # ------------------------------------------------------------- import / export

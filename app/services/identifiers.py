@@ -80,6 +80,17 @@ def quote_ident(name: str) -> str:
     return f'"{escaped}"'
 
 
+def quote_literal(value) -> str:
+    """Render a value as a safe single-quoted SQL string literal.
+
+    Doubles any embedded single quotes. Used for the fixed allow-list of an
+    enum CHECK constraint, where the permitted values come from metadata and
+    cannot be passed as bind parameters (they are baked into the DDL). Never
+    interpolate a raw value into SQL without this.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def qualified(schema: str, table: str) -> str:
     return f"{quote_ident(schema)}.{quote_ident(table)}"
 
@@ -97,6 +108,10 @@ TYPE_MAP: Dict[str, Dict] = {
     "date":      {"pg": "date",        "sized": False, "python": "date"},
     "timestamp": {"pg": "timestamptz", "sized": False, "python": "datetime"},
     "uuid":      {"pg": "uuid",        "sized": False, "python": "UUID"},
+    # A `reference` stores the resolved parent golden-record mdm_id (a uuid).
+    # Physically identical to uuid; the logical name drives FK generation and
+    # reference-data resolution in the pipeline.
+    "reference": {"pg": "uuid",        "sized": False, "python": "UUID"},
     "json":      {"pg": "jsonb",       "sized": False, "python": "dict"},
     "email":     {"pg": "varchar",     "sized": True,  "python": "str", "default_length": 320},
     "url":       {"pg": "text",        "sized": False, "python": "str"},
@@ -141,7 +156,7 @@ def type_rank(data_type: str, length: Optional[int] = None) -> tuple:
         "integer": ("num", 1), "bigint": ("num", 2),
         "decimal": ("num", 3), "float": ("num", 4),
         "boolean": ("bool", 1), "date": ("time", 1), "timestamp": ("time", 2),
-        "uuid": ("uuid", 1), "json": ("json", 1),
+        "uuid": ("uuid", 1), "reference": ("uuid", 1), "json": ("json", 1),
     }
     family, rank = families.get(key, ("other", 0))
     return (family, rank, length or 0)

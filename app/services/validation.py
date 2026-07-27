@@ -12,6 +12,12 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.services.logging_config import stream_logger
+from app.services.transforms import apply_transforms
+
+# Validation is part of ingestion (landing -> staging) -> "integration" stream.
+log = stream_logger("integration")
+
 TRUTHY = {"true", "t", "yes", "y", "1", "on"}
 FALSY = {"false", "f", "no", "n", "0", "off"}
 
@@ -255,8 +261,40 @@ def validate_record(payload: Dict[str, Any], entity, *, partial: bool = False) -
             continue
         if value is None and attr.default_value and not present:
             value, _ = coerce_value(attr.default_value, attr.data_type)
+        # Custom transforms (EX-2) run AFTER normalisation and coercion, in order.
+        # A transform failure (bad value or unknown name) becomes a structured
+        # validation error — the row is held invalid, never a crash.
+        transforms = getattr(attr, "transforms", None)
+        if transforms:
+            value, terr = apply_transforms(value, transforms, field=name)
+            if terr:
+                errors.append(
+                    ValidationError(name, terr["code"], terr["message"], value)
+                )
+                coerced[name] = None
+                continue
+            # A transform may emit a value of the wrong logical type (e.g. a map
+            # that yields text for a numeric column). Re-coerce so that becomes a
+            # per-row structured validation error (row held invalid in staging),
+            # mirroring the normal coercion path — never a whole-row INSERT crash.
+            value, cerr = coerce_value(value, attr.data_type)
+            if cerr:
+                errors.append(ValidationError(name, "type", cerr, value))
+                coerced[name] = None
+                continue
         coerced[name] = value
         errors.extend(check_constraints(name, value, attr))
+
+    if errors:
+        # Field/code only — never the raw values (may be PII) at this level.
+        log.debug(
+            "record failed validation entity=%s errors=%s",
+            getattr(entity, "name", None), len(errors),
+            extra={"event": "record_invalid",
+                   "entity": getattr(entity, "name", None),
+                   "error_count": len(errors),
+                   "error_codes": sorted({e.get("code") for e in errors})},
+        )
 
     return {"values": coerced, "errors": errors, "is_valid": not errors}
 

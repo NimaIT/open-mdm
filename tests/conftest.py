@@ -31,6 +31,7 @@ from app.models import (  # noqa: E402
     Role,
     User,
     UserSource,
+    WorkflowTask,
 )
 from app.services.auth import hash_password  # noqa: E402
 from app.services.bootstrap import create_metadata_tables, create_schemas  # noqa: E402
@@ -60,6 +61,20 @@ def _provision():
         return
     create_schemas()
     create_metadata_tables()
+    # Retire orphaned active workflow tasks left by earlier test runs (their
+    # entities were dropped, but the append-only event chain blocks deleting the
+    # task). Terminating them — an UPDATE, which the AO-2 trigger permits — keeps
+    # the shared scratch DB's active-task queries (inbox, admin workflows) clean.
+    with get_engine().begin() as c:
+        c.execute(
+            text(
+                "update mdm_meta.workflow_task t "
+                "set status = 'terminated' "
+                "where t.status in ('pending_review','changes_requested') "
+                "and not exists (select 1 from mdm_meta.entity e "
+                "                where e.name = t.entity_name)"
+            )
+        )
     yield
 
 
@@ -169,9 +184,17 @@ def entity_factory(db):
                 s.query(PromotionBatch).filter(
                     PromotionBatch.entity_name == name
                 ).delete(synchronize_session=False)
-                s.query(AuditEvent).filter(
-                    AuditEvent.entity_name == name
-                ).delete(synchronize_session=False)
+                # audit_event and workflow_event are append-only at the DB level
+                # (AO-2 trigger), so they are deliberately NOT deleted. WorkflowTask
+                # rows cannot be deleted either (their immutable events reference
+                # them), but they CAN be UPDATEd — so retire any leftover tasks to a
+                # terminal status. That keeps active-task queries (inbox, admin
+                # workflows) clean across the suite instead of accumulating stale
+                # pending tasks for dropped entities.
+                s.query(WorkflowTask).filter(
+                    WorkflowTask.entity_name == name,
+                    WorkflowTask.status.in_(["pending_review", "changes_requested"]),
+                ).update({"status": "terminated"}, synchronize_session=False)
         except Exception:
             pass
 

@@ -21,11 +21,17 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.db import get_engine
 from app.models import AuditEvent, Entity, PromotionBatch
+from app.services import hooks, workflow
 from app.services.identifiers import qualified, quote_ident
+from app.services.logging_config import stream_logger
+from app.services.mappings import apply_field_mappings, load_field_mappings
+from app.services.references import reresolve_broken_references, resolve_references
 from app.services.validation import build_match_key, validate_record
 
-log = logging.getLogger(__name__)
+# Ingestion pipeline logs flow on the "integration" stream (AO-1).
+log = stream_logger("integration")
 
 OP_INSERT = "INSERT"
 OP_UPDATE = "UPDATE"
@@ -141,11 +147,19 @@ def promote_landing_to_staging(
     landing_ids: Optional[Sequence[int]] = None,
     limit: int = 1000,
     actor: str = "system",
+    rationale: Optional[str] = None,
+    rationales: Optional[Dict[int, str]] = None,
+    ip_address: Optional[str] = None,
 ) -> Dict:
     """Validate, type and de-duplicate landing rows into staging.
 
     Rows that fail validation are still written to staging, flagged invalid
     with their errors attached — that is the whole point of a staging tier.
+
+    A ``WorkflowTask`` (status ``pending_review``) is created for every promoted
+    row and a ``submit`` event opens its decision chain (GC-1/AO-2). A submission
+    ``rationale`` may be attached per landing row (``rationales`` map) or applied
+    to the whole run (``rationale``).
     """
     landing_t = qualified(settings.SCHEMA_LANDING, entity.name)
     staging_t = qualified(settings.SCHEMA_STAGING, entity.name)
@@ -156,6 +170,13 @@ def promote_landing_to_staging(
     )
     db.add(batch)
     db.flush()
+
+    log.info(
+        "landing->staging promotion start entity=%s batch=%s",
+        entity.name, batch.id,
+        extra={"event": "promotion_start", "entity": entity.name,
+               "batch_id": str(batch.id), "actor": actor},
+    )
 
     where = "mdm_status = 'pending'"
     params: Dict[str, Any] = {"lim": limit}
@@ -176,6 +197,12 @@ def promote_landing_to_staging(
     attr_names = [a.name for a in entity.attributes]
     ok = failed = 0
     results: List[Dict] = []
+    # One parent business-key lookup cache for the whole batch (avoids an N+1
+    # metadata query per row inside resolve_references).
+    ref_column_cache: Dict[str, Any] = {}
+    # EX-3: field mappings for this entity, loaded once per run. Applied per row
+    # BEFORE validation, keyed by the landing row's source system.
+    field_mappings = load_field_mappings(db, entity.name)
 
     for r in rows:
         landing_id, operation, payload, target_id, source, src_batch, submitted_by = r
@@ -187,12 +214,44 @@ def promote_landing_to_staging(
             # record and sends only what changes. Required-field checks must not
             # fire for fields the caller legitimately omitted.
             partial = operation in (OP_UPDATE, OP_DELETE)
-            outcome = validate_record(payload or {}, entity, partial=partial)
+            # EX-3: rename source fields to target attributes before validation.
+            # The RAW landing payload is untouched (capture-first) — this only
+            # shapes the copy that flows into staging.
+            mapped_payload, map_errors = apply_field_mappings(
+                entity, payload or {}, source_system=source, mappings=field_mappings,
+            )
+            outcome = validate_record(mapped_payload, entity, partial=partial)
             values, errors = outcome["values"], list(outcome["errors"])
+            errors.extend(map_errors)
+
+            # Resolve reference attributes (human-readable value -> parent
+            # mdm_id). Unresolvable references attach a soft error and null the
+            # column, so the row is held invalid in staging until the parent
+            # exists (DQ-2 / DQ-5). Must run before match-key and target
+            # resolution so those see the resolved values.
+            resolve_references(
+                db, conn, entity, values, errors,
+                ref_column_cache=ref_column_cache,
+            )
+
+            # EX-1: pre_stage hooks cleanse/default the coerced values before the
+            # staging insert. A hook exception becomes a structured row error (row
+            # invalid) rather than a 500 — handled inside run_pre_stage.
+            before_hook = dict(values)
+            hooks.run_pre_stage(
+                entity.name, values=values, errors=errors, operation=operation,
+                actor=actor, db=db, conn=conn,
+            )
 
             # Record exactly which business fields the caller sent, so the apply
             # step can distinguish an omitted field from one set to its default.
-            supplied_fields = [a for a in attr_names if a in (payload or {})]
+            # A field a pre_stage hook set/changed counts as supplied, so its
+            # cleansed value is actually written through to the golden record.
+            supplied_fields = [a for a in attr_names if a in (mapped_payload or {})]
+            hook_touched = [a for a in attr_names
+                            if values.get(a) != before_hook.get(a)]
+            if hook_touched:
+                supplied_fields = sorted(set(supplied_fields) | set(hook_touched))
 
             match_key = build_match_key(values, entity)
 
@@ -251,6 +310,21 @@ def promote_landing_to_staging(
                 ),
                 {"id": landing_id},
             )
+
+            # Open the governed-change workflow for this staging row: one task +
+            # a submit event carrying the submission rationale (GC-1). The task
+            # is the authoritative governance state; the staging row is the data.
+            submit_rationale = (rationales or {}).get(landing_id, rationale)
+            # Create the task + submit event on the SAME conn as the staging
+            # INSERT, so promotion is atomic and the task is committed with it —
+            # a later decision on a separate connection can then see it (MAJOR-2).
+            workflow.create_task_on_submit_core(
+                conn, entity, staging_id,
+                submitted_by=submitted_by,
+                submit_rationale=submit_rationale,
+                change_type=change_type,
+                ip_address=ip_address,
+            )
             ok += 1
             results.append(
                 {
@@ -274,13 +348,30 @@ def promote_landing_to_staging(
             failed += 1
             results.append({"landing_id": landing_id, "error": str(exc)})
 
+    # DQ-5: newly-arrived parents may unblock children that were previously held
+    # invalid on a broken reference. Re-resolve a bounded window automatically.
+    try:
+        reresolved = reresolve_broken_references(db, conn, entity, limit=500)
+    except Exception:  # never let re-resolution abort a promotion run
+        log.exception("re-resolution pass failed for %s", entity.name)
+        reresolved = {"checked": 0, "unblocked": 0}
+
     batch.rows_in = len(rows)
     batch.rows_ok = ok
     batch.rows_failed = failed
     batch.status = "completed" if not failed else "completed_with_errors"
     batch.finished_at = datetime.utcnow()
-    batch.detail = {"results": results[:200]}
+    batch.detail = {"results": results[:200], "reresolved": reresolved}
     db.flush()
+
+    log.info(
+        "landing->staging promotion finished entity=%s batch=%s rows_in=%s ok=%s failed=%s",
+        entity.name, batch.id, len(rows), ok, failed,
+        extra={"event": "promotion_finished", "entity": entity.name,
+               "batch_id": str(batch.id), "rows_in": len(rows),
+               "rows_ok": ok, "rows_failed": failed,
+               "reresolved_unblocked": reresolved.get("unblocked", 0)},
+    )
 
     return {
         "batch_id": str(batch.id),
@@ -288,6 +379,7 @@ def promote_landing_to_staging(
         "promoted": ok,
         "failed": failed,
         "results": results,
+        "reresolved": reresolved,
     }
 
 
@@ -398,24 +490,39 @@ def apply_staging_to_live(
     actor_roles: Optional[List[str]] = None,
     review_note: Optional[str] = None,
     enforce_sod: Optional[bool] = None,
+    ip_address: Optional[str] = None,
 ) -> Dict:
     """Approve a staging row and apply it to the golden record.
 
     Writes a history row for every change. Runs inside the caller's
-    transaction so a failure leaves nothing half-applied.
+    transaction so a failure leaves nothing half-applied. Advances the
+    WorkflowTask to ``applied`` and appends an ``approve`` event (GC-1/GC-5).
     """
     staging_t = qualified(settings.SCHEMA_STAGING, entity.name)
     live_t = qualified(settings.SCHEMA_LIVE, entity.name)
     hist_t = qualified(settings.SCHEMA_HISTORY, entity.name)
 
+    # Lock the staging row for the whole decision (MAJOR-3): two concurrent
+    # approvals of the same record now serialise — the second sees
+    # 'applied'/'rejected' and is refused, so the golden record is never written
+    # twice.
     row = conn.execute(
-        text(f"select * from {staging_t} where mdm_staging_id = :id"), {"id": staging_id}
+        text(f"select * from {staging_t} where mdm_staging_id = :id for update"),
+        {"id": staging_id},
     ).mappings().first()
     if row is None:
         raise PipelineError(f"Staging record {staging_id} not found.")
     if row["mdm_status"] in (STATUS_APPLIED, STATUS_REJECTED):
         raise PipelineError(
             f"Staging record {staging_id} is already '{row['mdm_status']}'."
+        )
+    # Enforce the maker-checker loop (MINOR-5/GC-1): a row sent back for changes
+    # must be edited (resubmitted to pending_review) before it can be approved.
+    # Approving it directly would skip the resubmit half of the round-trip.
+    if row["mdm_status"] == STATUS_CHANGES_REQUESTED:
+        raise PipelineError(
+            f"Staging record {staging_id} is awaiting requested changes and "
+            "cannot be approved until it is edited and resubmitted for review."
         )
     if not row["mdm_is_valid"]:
         raise PipelineError(
@@ -443,6 +550,25 @@ def apply_staging_to_live(
     if isinstance(supplied, str):
         supplied = json.loads(supplied)
 
+    # EX-1: pre_commit hooks run BEFORE the golden write. They may mutate values
+    # or abort. A hook that raises aborts the apply cleanly (PipelineError) with
+    # the staging row left un-applied and pending — never a half-written record.
+    before_hook = dict(values)
+    hooks.run_pre_commit(
+        entity.name, values=values, operation=operation, actor=actor,
+        staging_id=staging_id, mdm_id=target_id, db=db, conn=conn,
+    )
+    # A hook may inject a key that is not a real attribute column; drop it so it
+    # can never turn into an UndefinedColumn 500 on the golden write (mirrors the
+    # attr_names filtering the pre_stage->staging path already applies). A hook
+    # that legitimately sets a real business field on an UPDATE must actually be
+    # written, so union any field it changed into supplied — otherwise only the
+    # caller-supplied fields apply and the cleansed value is silently dropped.
+    hook_changed = [c for c in attr_names if values.get(c) != before_hook.get(c)]
+    values = {c: v for c, v in values.items() if c in attr_names}
+    if hook_changed:
+        supplied = sorted(set(supplied) | set(hook_changed))
+
     if operation == OP_DELETE:
         result = _apply_delete(conn, entity, live_t, hist_t, target_id, actor)
     elif target_id:
@@ -452,6 +578,14 @@ def apply_staging_to_live(
         )
     else:
         result = _apply_insert(conn, live_t, values, actor, staging_id, row)
+
+    log.info(
+        "apply-to-live entity=%s staging=%s change_type=%s mdm_id=%s",
+        entity.name, staging_id, result.get("change_type"), result.get("mdm_id"),
+        extra={"event": "apply_to_live", "entity": entity.name,
+               "staging_id": staging_id, "change_type": result.get("change_type"),
+               "mdm_id": result.get("mdm_id"), "actor": actor},
+    )
 
     conn.execute(
         text(
@@ -472,12 +606,61 @@ def apply_staging_to_live(
             record_id=str(result.get("mdm_id")),
             tier="live",
             detail={"staging_id": staging_id, "note": review_note},
+            ip_address=ip_address,
             after_value={k: _json_default(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
                          for k, v in values.items()},
         )
     )
+    # Advance the task + append the approve event on the SAME conn/transaction as
+    # the staging status and golden-record writes, so governance state and tier
+    # state commit atomically — no crash window leaves them disagreeing (MAJOR-2).
+    workflow.record_decision_core(
+        conn, entity, staging_id, step=workflow.STEP_APPROVE,
+        to_status=workflow.APPLIED, actor=actor, actor_roles=actor_roles,
+        comment=review_note, ip_address=ip_address,
+    )
+    # EX-1: post_commit hooks are deliberately NOT run here. They must fire AFTER
+    # the caller's apply transaction has COMMITTED, so a chaining hook can observe
+    # the committed golden record and its external side effects aren't stranded if
+    # the outer commit later fails. Each call site runs them via
+    # ``run_post_commit_hooks`` once this transaction has committed.
     result["staging_id"] = staging_id
+    result["operation"] = operation
     return result
+
+
+def run_post_commit_hooks(
+    entity: Entity,
+    result: Optional[Dict],
+    *,
+    actor: str,
+    db: Optional[Session] = None,
+) -> List[Dict[str, str]]:
+    """Run EX-1 post_commit hooks AFTER the apply transaction has committed.
+
+    Opens a FRESH short transaction so a chaining hook sees the committed golden
+    record (via ``ctx.conn``) and any DB work it does is savepoint-isolated on
+    both the fresh connection and ``db``. Exceptions are swallowed and recorded on
+    ``result['post_commit_errors']``; they can never undo the committed change.
+
+    A no-op — **no connection is opened** — when the entity has no post_commit
+    hooks, so the zero-hook path keeps its original cost and behaviour.
+    """
+    if not result or not hooks.has_hooks(hooks.POST_COMMIT, entity.name):
+        return []
+    with get_engine().begin() as conn2:
+        errs = hooks.run_post_commit(
+            entity.name,
+            operation=result.get("operation"),
+            actor=actor,
+            staging_id=result.get("staging_id"),
+            mdm_id=result.get("mdm_id"),
+            result=result,
+            db=db, conn=conn2,
+        )
+    if errs:
+        result["post_commit_errors"] = errs
+    return errs
 
 
 def _apply_insert(conn, live_t, values, actor, staging_id, row) -> Dict:
@@ -600,28 +783,43 @@ def _write_history(conn, entity, hist_t, current, change_type, actor) -> None:
 def reject_staging(
     db: Session, conn: Connection, entity: Entity, staging_id: int, *,
     actor: str, reason: str, actor_roles: Optional[List[str]] = None,
+    ip_address: Optional[str] = None,
 ) -> Dict:
     staging_t = qualified(settings.SCHEMA_STAGING, entity.name)
-    updated = conn.execute(
+    # A rejected change is fully discarded (GC-3): terminal, no golden impact.
+    # It can never be applied later, so an already-terminal row is refused.
+    # Lock the row for the decision (MAJOR-3) so a concurrent approve/reject of the
+    # same record serialises rather than double-processing.
+    current = conn.execute(
+        text(f"select mdm_status from {staging_t} "
+             "where mdm_staging_id = :id for update"),
+        {"id": staging_id},
+    ).scalar()
+    if current is None or current in (STATUS_APPLIED, STATUS_REJECTED):
+        raise PipelineError(
+            f"Staging record {staging_id} not found or already applied/rejected."
+        )
+    conn.execute(
         text(
             f"""update {staging_t}
                 set mdm_status='{STATUS_REJECTED}', mdm_reviewed_by=:by,
                     mdm_reviewed_at=now(), mdm_review_note=:note
-                where mdm_staging_id=:id and mdm_status not in ('{STATUS_APPLIED}')
-                RETURNING mdm_staging_id"""
+                where mdm_staging_id=:id"""
         ),
         {"by": actor, "note": reason, "id": staging_id},
-    ).scalar()
-    if updated is None:
-        raise PipelineError(
-            f"Staging record {staging_id} not found or already applied."
-        )
+    )
     db.add(
         AuditEvent(
             actor=actor, actor_roles=actor_roles or [], action="reject",
             entity_name=entity.name, record_id=str(staging_id), tier="staging",
-            detail={"reason": reason},
+            detail={"reason": reason}, ip_address=ip_address,
         )
+    )
+    # Task advance + reject event share the conn with the staging write (MAJOR-2).
+    workflow.record_decision_core(
+        conn, entity, staging_id, step=workflow.STEP_REJECT,
+        to_status=workflow.REJECTED, actor=actor, actor_roles=actor_roles,
+        comment=reason, ip_address=ip_address,
     )
     return {"staging_id": staging_id, "status": STATUS_REJECTED, "reason": reason}
 
@@ -629,8 +827,12 @@ def reject_staging(
 def edit_staging(
     db: Session, conn: Connection, entity: Entity, staging_id: int, *,
     updates: Dict[str, Any], actor: str, actor_roles: Optional[List[str]] = None,
+    ip_address: Optional[str] = None,
 ) -> Dict:
-    """Steward polish: re-validate the edited row and update its error state."""
+    """Steward polish: re-validate the edited row and update its error state.
+
+    An edit returns the change request to ``pending_review`` — this is the
+    resubmit half of the ``changes_requested`` round-trip (GC-1)."""
     staging_t = qualified(settings.SCHEMA_STAGING, entity.name)
     row = conn.execute(
         text(f"select * from {staging_t} where mdm_staging_id=:id"), {"id": staging_id}
@@ -639,6 +841,12 @@ def edit_staging(
         raise PipelineError(f"Staging record {staging_id} not found.")
     if row["mdm_status"] == STATUS_APPLIED:
         raise PipelineError("Cannot edit a record that has already been applied.")
+    # A rejected/terminated change is fully discarded (GC-3) — editing it must not
+    # resurrect it back into an approvable state.
+    if row["mdm_status"] == STATUS_REJECTED:
+        raise PipelineError(
+            "Cannot edit a record that has been rejected or terminated."
+        )
 
     attr_names = [a.name for a in entity.attributes]
     merged = {c: row[c] for c in attr_names if c in row}
@@ -650,7 +858,10 @@ def edit_staging(
     outcome = validate_record(
         merged, entity, partial=(row["mdm_operation"] in (OP_UPDATE, OP_DELETE))
     )
-    values, errors = outcome["values"], outcome["errors"]
+    values, errors = outcome["values"], list(outcome["errors"])
+    # Re-resolve references so a steward's correction (or a now-present parent)
+    # is reflected before the row is re-validated for approval.
+    resolve_references(db, conn, entity, values, errors)
     match_key = build_match_key(values, entity)
 
     # A steward's edits count as supplied — otherwise the repair they just made
@@ -680,10 +891,17 @@ def edit_staging(
         AuditEvent(
             actor=actor, actor_roles=actor_roles or [], action="edit_staging",
             entity_name=entity.name, record_id=str(staging_id), tier="staging",
-            detail={"fields": sorted(updates)},
+            detail={"fields": sorted(updates)}, ip_address=ip_address,
             before_value={k: _json_default(row[k]) for k in updates if k in row},
             after_value={k: _json_default(v) for k, v in updates.items()},
         )
+    )
+    # An edit resubmits the change: task returns to pending_review (GC-1). The
+    # task advance + edit event share the conn with the staging write (MAJOR-2).
+    workflow.record_decision_core(
+        conn, entity, staging_id, step=workflow.STEP_EDIT,
+        to_status=workflow.PENDING_REVIEW, actor=actor, actor_roles=actor_roles,
+        comment=None, ip_address=ip_address,
     )
     return {
         "staging_id": staging_id,

@@ -158,6 +158,27 @@ class TestValidateDocument:
         defs, errors = validate_document({"entities": []})
         assert defs == [] and errors
 
+    def test_rejects_invalid_kind(self):
+        defs, errors = validate_document(
+            {"entities": [{"name": "k_bad", "kind": "widget", "attributes": [
+                {"name": "c", "data_type": "string", "is_business_key": True}]}]}
+        )
+        assert defs == [] and any("kind" in e for e in errors)
+
+    def test_accepts_association_kind(self):
+        defs, errors = validate_document(
+            {"entities": [{"name": "k_assoc", "kind": "association", "attributes": [
+                {"name": "c", "data_type": "string", "is_business_key": True}]}]}
+        )
+        assert defs and defs[0]["kind"] == "association"
+
+    def test_defaults_kind_to_master(self):
+        defs, _ = validate_document(
+            {"entities": [{"name": "k_def", "attributes": [
+                {"name": "c", "data_type": "string", "is_business_key": True}]}]}
+        )
+        assert defs[0]["kind"] == "master"
+
     def test_coerces_string_normalization_to_list(self):
         defs, _ = validate_document(
             {"entities": [{"name": "e5", "attributes": [
